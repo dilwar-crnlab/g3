@@ -23,9 +23,19 @@ class DeepRMSAEnv(RMSAEnv):
         num_rnn_hidden=64,    # New parameter for RNN hidden size
         
     ):
-        # Extract GCN/RNN specific parameters first
+        
+        # Validate parameters
+        assert num_gcn_features > 0, "GCN features must be positive"
+        assert num_rnn_hidden > 0, "RNN hidden size must be positive"
+        assert k_paths > 0, "Number of paths must be positive"
+        assert j > 0, "J parameter must be positive"
+        
+        # Set parameters before parent initialization
         self.num_gcn_features = num_gcn_features
         self.num_rnn_hidden = num_rnn_hidden
+        self.k_paths = k_paths
+        self.j = j
+
 
         super().__init__(
             topology=topology,
@@ -39,11 +49,6 @@ class DeepRMSAEnv(RMSAEnv):
             reset=False,
         )
 
-        # Initialize parameters
-        self.j = j
-        self.k_paths = k_paths
-        self.num_gcn_features = num_gcn_features
-        self.num_rnn_hidden = num_rnn_hidden
 
         # Add spectrum metrics constants here
         self.NUM_SPECTRUM_METRICS = 6  # Number of spectrum metrics per path
@@ -56,69 +61,26 @@ class DeepRMSAEnv(RMSAEnv):
             'required_slots'
         ]
 
-        # Define new observation space for GCN-RNN
-        self.observation_space = gym.spaces.Dict({
-            # GCN features
-            "topology": gym.spaces.Dict({
-                "adjacency_matrix": gym.spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(self.topology_transform.transformed_topology.number_of_nodes(),
-                          self.topology_transform.transformed_topology.number_of_nodes()),
-                    dtype=np.int8
-                ),
-                "node_features": gym.spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(self.topology_transform.transformed_topology.number_of_nodes(),
-                          self.num_spectrum_resources),
-                    dtype=np.int8
-                )
-            }),
-            # Path features for RNN
-            "paths": gym.spaces.Dict({
-                "features": gym.spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.k_paths, self.num_rnn_hidden),
-                    dtype=np.float32
-                ),
-                "lengths": gym.spaces.Box(
-                    low=0,
-                    high=self.topology.number_of_nodes(),
-                    shape=(self.k_paths,),
-                    dtype=np.int32
-                )
-            }),
-            # Spectrum metrics
-            "spectrum": gym.spaces.Dict({
-                "metrics": gym.spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.k_paths, 6),  # 6 metrics per path
-                    dtype=np.float32
-                )
-            }),
-            # Service features
-            "service": gym.spaces.Dict({
-                "source_destination_tau": gym.spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(2, self.topology.number_of_nodes()),
-                    dtype=np.int8
-                ),
-                "bit_rate": gym.spaces.Box(
-                    low=0,
-                    high=np.inf,
-                    shape=(1,),
-                    dtype=np.float32
-                )
-            })
-        })
+        # Calculate observation space size
+        total_size = (self.topology.number_of_nodes() * self.topology.number_of_nodes() + 
+                     self.topology.number_of_nodes() * self.num_spectrum_resources +
+                     2 * self.topology.number_of_nodes() + 1 +
+                     self.k_paths * self.num_spectrum_resources +
+                     self.k_paths * self.NUM_SPECTRUM_METRICS)
 
+        # Flattened observation space
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(total_size,),
+            dtype=np.float32
+        )
+
+        # Single discrete action space
         self.action_space = gym.spaces.Discrete(
             self.k_paths * self.j + self.reject_action
         )
+        
         self.action_space.seed(self.rand_seed)
         self.observation_space.seed(self.rand_seed)
         
@@ -139,18 +101,80 @@ class DeepRMSAEnv(RMSAEnv):
 
     
     def observation(self):
-        """Get observation using parent class implementation"""
-        obs = super().observation()
+        """Get observation with essential GCN/RNN features and return flattened array"""
+        # Get topology size
+        num_nodes = self.topology.number_of_nodes()
+        num_edges = self.topology.number_of_edges()
         
-        # Process paths through RNN if needed
-        path_features = obs['paths']['features']
-        processed_features = self._process_path_features(path_features)
+        # 1. Topology Features
+        # Adjacency matrix (num_edges x num_edges)
+        adj_matrix = self.topology_transform.get_adjacency_matrix().flatten()
+        # Node features (num_edges x num_spectrum_resources)
+        node_features = self.topology_transform.get_node_features(
+            self.topology.graph['available_slots']
+        ).flatten()
         
-        # Update path features with RNN processed version
-        obs['paths']['features'] = processed_features
+        # 2. Service Features
+        # Source-destination encoding (2 x num_nodes)
+        source_destination_tau = np.zeros((2, num_nodes))
+        source_destination_tau[0, self.current_service.source_id] = 1
+        source_destination_tau[1, self.current_service.destination_id] = 1
+        source_destination_tau = source_destination_tau.flatten()
+        # Bit rate (1)
+        bit_rate = np.array([self.current_service.bit_rate/100.0])
         
-        return obs
-    
+        # 3. Path Features
+        paths = self.k_shortest_paths[
+            self.current_service.source, 
+            self.current_service.destination
+        ][:self.k_paths]
+        
+        path_features = np.zeros((self.k_paths, self.num_spectrum_resources))
+        for idx, path in enumerate(paths):
+            if idx < len(paths):
+                slots = self.get_available_slots(path)
+                path_features[idx] = slots
+        path_features = path_features.flatten()
+        
+        # 4. Spectrum Metrics (5 metrics per path)
+        spectrum_metrics = np.zeros((self.k_paths, 5))
+        for idx, path in enumerate(paths):
+            if idx < len(paths):
+                available_slots = self.get_available_slots(path)
+                num_slots = self.get_number_slots(path)
+                initial_indices, lengths = self.get_available_blocks(idx)
+                
+                spectrum_metrics[idx] = [
+                    np.sum(available_slots)/self.num_spectrum_resources,  # normalized total available
+                    len(initial_indices),  # num blocks
+                    max(lengths, default=0)/self.num_spectrum_resources,  # normalized largest block
+                    initial_indices[0]/self.num_spectrum_resources if len(initial_indices) > 0 else -1,  # normalized first block start
+                    lengths[0]/self.num_spectrum_resources if len(lengths) > 0 else -1  # normalized first block size
+                ]
+        spectrum_metrics = spectrum_metrics.flatten()
+        
+        # Concatenate all features
+        observation = np.concatenate([
+            adj_matrix,           # num_edges * num_edges
+            node_features,        # num_edges * num_spectrum_resources
+            source_destination_tau,  # 2 * num_nodes
+            bit_rate,               # 1
+            path_features,          # k_paths * num_spectrum_resources
+            spectrum_metrics        # k_paths * 5
+        ]).astype(np.float32)
+        
+        # Print shape info for debugging
+        print(f"Shape info:")
+        print(f"Adjacency matrix: {adj_matrix.shape}")
+        print(f"Node features: {node_features.shape}")
+        print(f"Source-dest tau: {source_destination_tau.shape}")
+        print(f"Bit rate: {bit_rate.shape}")
+        print(f"Path features: {path_features.shape}")
+        print(f"Spectrum metrics: {spectrum_metrics.shape}")
+        print(f"Total observation: {observation.shape}")
+        
+        return observation
+        
     def _process_path_features(self, path_features: np.ndarray) -> np.ndarray:
         """Process path features through RNN-like aggregation"""
         # This is a placeholder for actual RNN processing

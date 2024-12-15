@@ -171,7 +171,7 @@ class OpticalNetworkEnv(gym.Env):
         return {"topology": self.topology, "service": self.current_service}
 
     def reward(self):
-        return 1 if self.current_service.accepted else 0
+        return 1 if self.current_service.accepted else -1
 
     def reset(self) -> None:
         self._events = []

@@ -204,20 +204,25 @@ class RMSAEnv(OpticalNetworkEnv):
         self.episode_slots_provisioned_histogram = defaultdict(int)
 
     def _init_transformed_topology_attributes(self):
-        """Initialize attributes for transformed topology"""
-        # Store transformed topology in original topology graph
-        self.topology.graph['transformed_topology'] = self.topology_transform.transformed_topology
-        
-        # Initialize node features matrix for transformed topology
-        num_transformed_nodes = self.topology_transform.transformed_topology.number_of_nodes()
-        self.topology.graph['node_features'] = np.zeros((num_transformed_nodes, self.num_spectrum_resources))
-        
-        # Initialize adjacency matrix for transformed topology
-        self.topology.graph['adjacency_matrix'] = self.topology_transform.get_adjacency_matrix()
-        
-        # Store mappings for easy access
-        self.topology.graph['edge_to_node_map'] = self.topology_transform.edge_to_node_map
-        self.topology.graph['node_to_edge_map'] = self.topology_transform.node_to_edge_map
+        """Initialize attributes for transformed topology with error handling"""
+        try:
+            # Store transformed topology in original topology graph
+            self.topology.graph['transformed_topology'] = self.topology_transform.transformed_topology
+            
+            # Initialize node features matrix for transformed topology
+            num_transformed_nodes = self.topology_transform.transformed_topology.number_of_nodes()
+            self.topology.graph['node_features'] = np.zeros((num_transformed_nodes, self.num_spectrum_resources))
+            
+            # Initialize adjacency matrix for transformed topology
+            self.topology.graph['adjacency_matrix'] = self.topology_transform.get_adjacency_matrix()
+            
+            # Store mappings for easy access
+            self.topology.graph['edge_to_node_map'] = self.topology_transform.edge_to_node_map
+            self.topology.graph['node_to_edge_map'] = self.topology_transform.node_to_edge_map
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize topology attributes: {str(e)}")
+            raise
 
     def _init_spaces(self):
         """Initialize observation and action spaces for GCN/RNN environment"""
@@ -231,84 +236,33 @@ class RMSAEnv(OpticalNetworkEnv):
             fill_value=-1,
             dtype=int,
         )
-        self.actions_output = np.zeros(
-            (self.k_paths + 1, self.num_spectrum_resources + 1), 
-            dtype=int
-        )
-        self.episode_actions_output = np.zeros(
-            (self.k_paths + 1, self.num_spectrum_resources + 1), 
-            dtype=int
-        )
-        self.actions_taken = np.zeros(
-            (self.k_paths + 1, self.num_spectrum_resources + 1), 
-            dtype=int
-        )
-        self.episode_actions_taken = np.zeros(
-            (self.k_paths + 1, self.num_spectrum_resources + 1), 
-            dtype=int
-        )
 
-        # Define common observation space structure
-        self.observation_space = gym.spaces.Dict({
-            "topology": gym.spaces.Dict({
-                "adjacency_matrix": gym.spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(self.topology_transform.transformed_topology.number_of_nodes(),
-                          self.topology_transform.transformed_topology.number_of_nodes()),
-                    dtype=np.int8
-                ),
-                "node_features": gym.spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(self.topology_transform.transformed_topology.number_of_nodes(),
-                          self.num_spectrum_resources),
-                    dtype=np.int8
-                )
-            }),
-            "service": gym.spaces.Dict({
-                "source_destination_tau": gym.spaces.Box(
-                    low=0,
-                    high=1,
-                    shape=(2, self.topology.number_of_nodes()),
-                    dtype=np.int8
-                ),
-                "bit_rate": gym.spaces.Box(
-                    low=0,
-                    high=float('inf'),
-                    shape=(1,),
-                    dtype=np.float32
-                ),
-                "required_slots": gym.spaces.Box(
-                    low=0,
-                    high=self.num_spectrum_resources,
-                    shape=(self.k_paths,),
-                    dtype=np.int32
-                )
-            }),
-            "spectrum": gym.spaces.Dict({
-                "metrics": gym.spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.k_paths, self.NUM_SPECTRUM_METRICS),
-                    dtype=np.float32
-                )
-            }),
-            "paths": gym.spaces.Dict({
-                "features": gym.spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.k_paths, self.num_spectrum_resources),
-                    dtype=np.float32
-                ),
-                "lengths": gym.spaces.Box(
-                    low=0,
-                    high=self.topology.number_of_nodes(),
-                    shape=(self.k_paths,),
-                    dtype=np.int32
-                )
-            })
-        })
+        # Track actions
+        self.actions_output = np.zeros((self.k_paths + 1, self.num_spectrum_resources + 1), dtype=int)
+        self.episode_actions_output = np.zeros((self.k_paths + 1, self.num_spectrum_resources + 1), dtype=int)
+        self.actions_taken = np.zeros((self.k_paths + 1, self.num_spectrum_resources + 1), dtype=int)
+        self.episode_actions_taken = np.zeros((self.k_paths + 1, self.num_spectrum_resources + 1), dtype=int)
+
+
+        # Calculate dimensions for flattened observation space
+        topology_size = (self.topology_transform.transformed_topology.number_of_nodes() * 
+                        self.topology_transform.transformed_topology.number_of_nodes() +  # adjacency matrix
+                        self.topology_transform.transformed_topology.number_of_nodes() * 
+                        self.num_spectrum_resources)  # node features
+        service_size = 2 * self.topology.number_of_nodes() + 1  # source_dest_tau + bit_rate
+        path_size = self.k_paths * self.num_spectrum_resources  # path features
+        spectrum_metrics_size = self.k_paths * self.NUM_SPECTRUM_METRICS  # spectrum metrics
+
+        total_size = topology_size + service_size + path_size + spectrum_metrics_size
+
+        # Flattened observation space
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(total_size,),
+            dtype=np.float32
+        )
+        
 
         # Action space
         self.action_space = gym.spaces.MultiDiscrete(
@@ -347,24 +301,47 @@ class RMSAEnv(OpticalNetworkEnv):
         return features
     
     def _get_all_path_features(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Get features for all k-shortest paths"""
-        paths = self.k_shortest_paths[self.current_service.source, 
-                                    self.current_service.destination]
+        """Get features for all k-shortest paths.
         
-        path_features = []
-        path_lengths = []
+        Returns:
+            Tuple[np.ndarray, np.ndarray]: 
+                - Array of path features shape (k_paths, num_spectrum_resources)
+                - Array of path lengths shape (k_paths,)
+        """
+        try:
+            # Get paths for current service
+            paths = self.k_shortest_paths[
+                self.current_service.source, 
+                self.current_service.destination
+            ]
+            
+            path_features = []
+            path_lengths = []
+            
+            # Process at most k_paths paths
+            for path in paths[:self.k_paths]:
+                # Get available slots across the path
+                available_slots = self.get_available_slots(path)
+                
+                # Calculate required slots for this path
+                required_slots = self.get_number_slots(path)
+                
+                # Get path features - available slots status
+                features = available_slots
+                
+                path_features.append(features)
+                path_lengths.append(len(path.node_list) - 1)
+            
+            # Pad if we have fewer than k_paths paths
+            while len(path_features) < self.k_paths:
+                path_features.append(np.zeros(self.num_spectrum_resources))
+                path_lengths.append(0)
+            
+            return np.array(path_features), np.array(path_lengths)
         
-        for path in paths:
-            features = self._get_path_features(path)
-            path_features.append(features)
-            path_lengths.append(len(path.node_list) - 1)
-            
-        # Pad to k_paths if necessary
-        while len(path_features) < self.k_paths:
-            path_features.append(np.zeros(self.num_spectrum_resources))
-            path_lengths.append(0)
-            
-        return np.array(path_features), np.array(path_lengths)
+        except Exception as e:
+            self.logger.error(f"Error getting path features: {str(e)}")
+            raise
 
     def step(self, action):
         path, initial_slot = action[0], action[1]
@@ -462,44 +439,41 @@ class RMSAEnv(OpticalNetworkEnv):
 
         return (self.observation(), reward, self.episode_services_processed == self.episode_length, info,)
     
-    def observation(self) -> dict:
-        """Return the observation of the environment"""
-        # Get path features and lengths
-        path_features, path_lengths = self._get_all_path_features()
-        
+    def observation(self) -> np.ndarray:
+        """Return flattened observation compatible with stable-baselines3"""
         # Get topology features
-        topology_features = {
-            "adjacency_matrix": self.topology_transform.get_adjacency_matrix(),
-            "node_features": self.topology_transform.get_node_features(
-                self.topology.graph['available_slots']
-            )
-        }
+        adjacency_matrix = self.topology_transform.get_adjacency_matrix().flatten()
+        node_features = self.topology_transform.get_node_features(
+            self.topology.graph['available_slots']
+        ).flatten()
         
         # Get service features
-        service_features = {
-            "source_destination_tau": self._get_source_destination_tau(),
-            "bit_rate": np.array([self.current_service.bit_rate]),
-            "required_slots": np.array([
-                self.get_number_slots(path) 
-                for path in self.k_shortest_paths[
-                    self.current_service.source, 
-                    self.current_service.destination
-                ][:self.k_paths]
-            ])
-        }
+        source_destination_tau = self._get_source_destination_tau().flatten()
+        bit_rate = np.array([self.current_service.bit_rate / 100.0])  # Normalize bit rate
+        
+        # Get path features
+        path_features, _ = self._get_all_path_features()
+        path_features = path_features.flatten()
         
         # Get spectrum metrics
         spectrum_metrics = self._get_all_paths_spectrum_metrics()
+        spectrum_features = []
+        for metric in self.spectrum_metric_names:
+            if metric in spectrum_metrics:
+                spectrum_features.append(spectrum_metrics[metric])
+        spectrum_features = np.array(spectrum_features, dtype=np.float32).flatten()
         
-        return {
-            "topology": topology_features,
-            "service": service_features,
-            "spectrum": spectrum_metrics,
-            "paths": {
-                "features": path_features,
-                "lengths": path_lengths
-            }
-        }
+        # Concatenate all features
+        observation = np.concatenate([
+            adjacency_matrix,
+            node_features,
+            source_destination_tau,
+            bit_rate,
+            path_features,
+            spectrum_features
+        ])
+        
+        return observation.astype(np.float32)
 
     def reset(self, only_episode_counters=True):
         # Reset episode-specific counters
@@ -851,17 +825,25 @@ class RMSAEnv(OpticalNetworkEnv):
         return True
 
     def get_available_slots(self, path: Path):
-        available_slots = functools.reduce(
-            np.multiply,
-            self.topology.graph["available_slots"][
-                [
-                    self.topology[path.node_list[i]][path.node_list[i + 1]]["id"]
-                    for i in range(len(path.node_list) - 1)
+        """Get available slots with proper error handling and index consistency"""
+        try:
+            available_slots = functools.reduce(
+                np.multiply,
+                self.topology.graph["available_slots"][
+                    [
+                        self.topology[path.node_list[i]][path.node_list[i + 1]]["index"]  # Changed from "id" to "index"
+                        for i in range(len(path.node_list) - 1)
+                    ],
+                    :,
                 ],
-                :,
-            ],
-        )
-        return available_slots
+            )
+            return available_slots
+        except KeyError as e:
+            self.logger.error(f"Missing index in topology for path {path.node_list}: {str(e)}")
+            raise
+        except Exception as e:
+            self.logger.error(f"Error getting available slots: {str(e)}")
+            raise
 
     def rle(inarray):
         """run length encoding. Partial credit to R rle function.
